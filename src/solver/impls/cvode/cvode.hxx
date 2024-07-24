@@ -123,6 +123,7 @@ private:
   /// Use right preconditioner? Otherwise use left.
   bool rightprec;
   bool use_jacobian;
+  int cvode_max_conv_fails;
   BoutReal cvode_nonlinear_convergence_coef;
   BoutReal cvode_linear_convergence_coef;
 
