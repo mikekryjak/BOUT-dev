@@ -121,6 +121,10 @@ CvodeSolver::CvodeSolver(Options* opts)
                     .doc("Use right preconditioner? Otherwise use left.")
                     .withDefault(false)),
       use_jacobian((*options)["use_jacobian"].withDefault(false)),
+      cvode_max_conv_fails((*options)["cvode_max_conv_fails"]
+                               .doc("Maximum number of nonlinear solver convergence "
+                                    "failures permitted during one step")
+                               .withDefault(10)),
       cvode_nonlinear_convergence_coef(
           (*options)["cvode_nonlinear_convergence_coef"]
               .doc("Safety factor used in the nonlinear convergence test")
@@ -133,6 +137,11 @@ CvodeSolver::CvodeSolver(Options* opts)
       suncontext(createSUNContext(BoutComm::get())) {
   has_constraints = false; // This solver doesn't have constraints
   canReset = true;
+
+  debug_on_failure =
+      (*options)["debug_on_failure"]
+          .doc("Run an aditional rhs if the solver fails with extra tracking")
+          .withDefault(false);
 
   // Add diagnostics to output
   // Needs to be in constructor not init() because init() is called after
@@ -385,6 +394,10 @@ int CvodeSolver::init() {
     }
   }
 
+  if (CVodeSetMaxConvFails(cvode_mem, cvode_max_conv_fails) != CV_SUCCESS) {
+    throw BoutException("CVodeSetMaxConvFails failed\n");
+  }
+
   // Set internal tolerance factors
   if (CVodeSetNonlinConvCoef(cvode_mem, cvode_nonlinear_convergence_coef) != CV_SUCCESS) {
     throw BoutException("CVodeSetNonlinConvCoef failed\n");
@@ -436,6 +449,60 @@ CvodeSolver::create_constraints(const std::vector<VarStr<FieldType>>& fields) {
   return constraints;
 }
 
+void CVode::do_debug() {
+  if (not(f2d.empty() and v2d.empty() and v3d.empty())) {
+    output_warn.write("debug_on_failure is currently only supported for Field3Ds");
+    return;
+  }
+  Options debug{};
+  using namespace std::string_literals;
+  Mesh* mesh{f3d[0].var->getMesh()};
+  // Backup data:
+  std::vector<Field3D> f3d_org;
+  for (const auto& f : f3d) {
+    f3d_org.emplace_back(*f.var);
+    f.var->allocate();
+  }
+  // pre
+  load_vars(udata);
+  for (const auto& f : f3d) {
+    debug[fmt::format("pre_{:s}", prefix, f.name)] = *f.var;
+  }
+  // residuum
+  N_Vector res_data = N_VNew_Parallel(BoutComm::get(), local_N, neq, suncontext);
+  CVodeGetEstLocalErrors(cv_mem, res_data);
+  load_vars(res_data);
+  for (const auto& f : f3d) {
+    debug[fmt::format("pre_{:s}", prefix, f.name)] = *f.var;
+  }
+  // restore
+  for (int i = 0; i < f3d.size(); ++i) {
+    *f3d[i].var = f3d_org[i];
+  }
+
+  for (auto& f : f3d) {
+    f.F_var->enableTracking(fmt::format("ddt_{:s}", f.name), debug);
+    setName(*f.var, f.name);
+  }
+  run_rhs(simtime);
+
+  for (auto& f : f3d) {
+    debug[f.name] = *f.var;
+  }
+
+  if (mesh != nullptr) {
+    mesh->outputVars(debug);
+    debug["BOUT_VERSION"].force(bout::version::as_double);
+  }
+
+  const std::string outname = fmt::format(
+      "{}/BOUT.debug.{}.nc", Options::root()["datadir"].withDefault<std::string>("data"),
+      BoutComm::rank());
+
+  bout::OptionsIO::create(outname)->write(debug);
+  MPI_Barrier(BoutComm::get());
+}
+
 /**************************************************************************
  * Run - Advance time
  **************************************************************************/
@@ -455,6 +522,10 @@ int CvodeSolver::run() {
     /// Check if the run succeeded
     if (simtime < 0.0) {
       // Step failed
+      if (debug_on_failure) {
+        output_warn.write("SUNDIALS CVODE timestep failed\n");
+        do_debug();
+      }
       throw BoutException("SUNDIALS CVODE timestep failed\n");
     }
 
@@ -543,6 +614,11 @@ BoutReal CvodeSolver::run(BoutReal tout) {
       flag = CVode(cvode_mem, tout, uvec, &internal_time, CV_ONE_STEP);
 
       if (flag < 0) {
+        if (debug_on_failure) {
+          output_warn.write("ERROR CVODE solve failed at t = {:e}, flag = {:d}\n",
+                            internal_time, flag);
+          do_debug();
+        }
         throw BoutException("ERROR CVODE solve failed at t = {:e}, flag = {:d}\n",
                             internal_time, flag);
       }
@@ -562,6 +638,10 @@ BoutReal CvodeSolver::run(BoutReal tout) {
   run_rhs(simtime);
 
   if (flag < 0) {
+    if (debug_on_failure) {
+      output.info("ERROR CVODE solve failed at t = {:e}, flag = {:d}\n", simtime, flag);
+      do_debug();
+    }
     throw BoutException("ERROR CVODE solve failed at t = {:e}, flag = {:d}\n", simtime,
                         flag);
   }
