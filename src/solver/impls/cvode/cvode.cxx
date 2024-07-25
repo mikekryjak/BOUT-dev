@@ -121,6 +121,7 @@ CvodeSolver::CvodeSolver(Options* opts)
                     .doc("Use right preconditioner? Otherwise use left.")
                     .withDefault(false)),
       use_jacobian((*options)["use_jacobian"].withDefault(false)),
+      cvode_max_conv_fails((*options)["cvode_max_conv_fails"].doc("Maximum number of nonlinear solver convergence failures permitted during one step").withDefault(10)),
       cvode_nonlinear_convergence_coef(
           (*options)["cvode_nonlinear_convergence_coef"]
               .doc("Safety factor used in the nonlinear convergence test")
@@ -383,6 +384,10 @@ int CvodeSolver::init() {
     } else {
       output_info.write("\tUsing difference quotient approximation for Jacobian\n");
     }
+  }
+
+  if (CVodeSetMaxConvFails(cvode_mem, cvode_max_conv_fails) != CV_SUCCESS) {
+    throw BoutException("CVodeSetMaxConvFails failed\n");
   }
 
   // Set internal tolerance factors
