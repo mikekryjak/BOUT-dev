@@ -121,7 +121,10 @@ CvodeSolver::CvodeSolver(Options* opts)
                     .doc("Use right preconditioner? Otherwise use left.")
                     .withDefault(false)),
       use_jacobian((*options)["use_jacobian"].withDefault(false)),
-      cvode_max_conv_fails((*options)["cvode_max_conv_fails"].doc("Maximum number of nonlinear solver convergence failures permitted during one step").withDefault(10)),
+      cvode_max_conv_fails((*options)["cvode_max_conv_fails"]
+                               .doc("Maximum number of nonlinear solver convergence "
+                                    "failures permitted during one step")
+                               .withDefault(10)),
       cvode_nonlinear_convergence_coef(
           (*options)["cvode_nonlinear_convergence_coef"]
               .doc("Safety factor used in the nonlinear convergence test")
