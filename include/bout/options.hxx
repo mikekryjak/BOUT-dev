@@ -200,9 +200,9 @@ public:
   }
 
   /// The type used to store values
-  using ValueType =
-      bout::utils::variant<bool, int, BoutReal, std::string, Field2D, Field3D, FieldPerp,
-                           Array<BoutReal>, Array<int>, Matrix<BoutReal>, Tensor<BoutReal>>;
+  using ValueType = bout::utils::variant<bool, int, BoutReal, std::string, Field2D,
+                                         Field3D, FieldPerp, Array<BoutReal>, Array<int>,
+                                         Matrix<BoutReal>, Tensor<BoutReal>>;
 
   /// A tree representation with leaves containing ValueType.
   /// Used to construct Options from initializer lists.
