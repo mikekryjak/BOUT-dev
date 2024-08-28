@@ -138,8 +138,10 @@ struct GetDimensions {
   std::vector<int> operator()([[maybe_unused]] int value) { return {1}; }
   std::vector<int> operator()([[maybe_unused]] BoutReal value) { return {1}; }
   std::vector<int> operator()([[maybe_unused]] const std::string& value) { return {1}; }
-  template<typename T>
-  std::vector<int> operator()(const Array<T>& array) { return {array.size()}; }
+  template <typename T>
+  std::vector<int> operator()(const Array<T>& array) {
+    return {array.size()};
+  }
   std::vector<int> operator()(const Matrix<BoutReal>& array) {
     const auto shape = array.shape();
     return {std::get<0>(shape), std::get<1>(shape)};
@@ -486,8 +488,8 @@ bool GridFile::get([[maybe_unused]] Mesh* m, [[maybe_unused]] std::vector<int>& 
 
   // Check size
   if (full_var.size() < len + offset) {
-    throw BoutException("{} has length {}. Expected {} elements + {} offset",
-                        name, full_var.size(), len, offset);
+    throw BoutException("{} has length {}. Expected {} elements + {} offset", name,
+                        full_var.size(), len, offset);
   }
 
   // Ensure that output variable has the correct size
