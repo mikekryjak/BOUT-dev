@@ -313,6 +313,9 @@ CvodeSolver::~CvodeSolver() {
     if (petsc_f != nullptr) {
       VecDestroy(&petsc_f);
     }
+    if (petsc_jac_computed != nullptr) {
+      MatDestroy(&petsc_jac_computed);
+    }
 #endif
   }
 }
@@ -767,6 +770,7 @@ int CvodeSolver::init() {
       }
 
       Field3D index = globalIndex(0);
+      PetscCall(MatDestroy(&petsc_jac_computed));
       PetscCall(petsc_preconditioner.createJacobianPattern(
           index, *options, local_N, n2Dvars(), n3Dvars(), BoutComm::get()));
       PetscCall(
@@ -1235,7 +1239,7 @@ PetscErrorCode CvodeSolver::petscFormRhsFunction(void* UNUSED(dummy), Vec x, Vec
 }
 
 int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
-                             CvodeBool UNUSED(jok), CvodeBool* jcurPtr, BoutReal gamma,
+                             CvodeBool jok, CvodeBool* jcurPtr, BoutReal gamma,
                              void* user_data) {
   auto* s = static_cast<CvodeSolver*>(user_data);
 
@@ -1245,6 +1249,35 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
   if (s->nvector_type == NVectorType::ManyVector) {
     throw BoutException("solver:cvode_precon_method=petsc is not supported with "
                         "solver:nvector=manyvector");
+  }
+
+  Mat J = s->petsc_preconditioner.jacobian();
+
+  // CVODE judges the last Jacobian still good: rescale it to the new gamma,
+  // I - gamma Jf = (gamma/gamma_c) (I - gamma_c Jf) + (1 - gamma/gamma_c) I,
+  // rather than recompute it at one RHS evaluation per colour
+  if (jok and s->petsc_jac_computed != nullptr) {
+    const BoutReal ratio = gamma / s->petsc_jac_gamma;
+    PetscErrorCode ierr = MatCopy(s->petsc_jac_computed, J, SAME_NONZERO_PATTERN);
+    if (ierr == 0) {
+      ierr = MatScale(J, ratio);
+    }
+    if (ierr == 0) {
+      ierr = MatShift(J, 1.0 - ratio);
+    }
+    if (ierr == 0) {
+      ierr = KSPSetOperators(s->petsc_ksp, J, J);
+    }
+    if (ierr == 0) {
+      ierr = KSPSetUp(s->petsc_ksp);
+    }
+    if (ierr != 0) {
+      return 1;
+    }
+    if (jcurPtr != nullptr) {
+      *jcurPtr = 0;
+    }
+    return 0;
   }
 
   auto* ydata = N_VGetArrayPointer(yy);
@@ -1266,7 +1299,6 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
     return 1;
   }
 
-  Mat J = s->petsc_preconditioner.jacobian();
   ierr = MatZeroEntries(J);
   if (ierr != 0) {
     VecResetArray(s->petsc_x);
@@ -1289,6 +1321,17 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
   }
 
   s->maybeExportJacobian(J, s->petsc_x, t, gamma);
+
+  if (s->petsc_jac_computed == nullptr) {
+    ierr = MatDuplicate(J, MAT_COPY_VALUES, &s->petsc_jac_computed);
+  } else {
+    ierr = MatCopy(J, s->petsc_jac_computed, SAME_NONZERO_PATTERN);
+  }
+  if (ierr != 0) {
+    VecResetArray(s->petsc_x);
+    return 1;
+  }
+  s->petsc_jac_gamma = gamma;
 
   ierr = KSPSetOperators(s->petsc_ksp, J, J);
   if (ierr == 0) {
@@ -1330,10 +1373,17 @@ int CvodeSolver::petscPSolve(BoutReal t, N_Vector yy, N_Vector UNUSED(yp), N_Vec
     ierr = KSPSolve(s->petsc_ksp, s->petsc_r, s->petsc_z);
   }
 
+  // A failed factorisation returns no error code, only a negative reason, and
+  // can leave Inf in z; report it to CVODE as a recoverable failure
+  KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
+  if (ierr == 0) {
+    ierr = KSPGetConvergedReason(s->petsc_ksp, &reason);
+  }
+
   VecResetArray(s->petsc_r);
   VecResetArray(s->petsc_z);
 
-  return ierr == 0 ? 0 : 1;
+  return (ierr == 0 and reason >= 0) ? 0 : 1;
 }
 
 PetscErrorCode CvodeSolver::petscUserShellApply(PC pc, Vec x, Vec y) {

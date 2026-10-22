@@ -231,6 +231,10 @@ private:
   PetscInt petsc_global_N{0};
   BoutReal petsc_gamma{0.0};
   BoutReal petsc_t{0.0};
+  /// Copy of the last finite-difference I - gamma J and its gamma, which
+  /// ``petscPSetup`` rescales while CVODE judges the Jacobian still good
+  Mat petsc_jac_computed{nullptr};
+  BoutReal petsc_jac_gamma{0.0};
   std::vector<BoutReal> petsc_rhs_tmp;
   // Arguments of the current petscPSolve, for the user preconditioner shell
   BoutReal petsc_shell_t{0.0};
