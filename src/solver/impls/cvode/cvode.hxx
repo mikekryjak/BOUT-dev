@@ -179,6 +179,8 @@ private:
       jacobian_export_kind; ///< Export ``system`` or ``rhs`` Jacobian
   bout::CvodeJacobianExportTrigger
       jacobian_export_trigger; ///< Export on ``output`` or ``linear_setup``
+  /// Save the right-hand side of the first N linear solves to ``datadir``
+  int save_linear_rhs;
 
   // Diagnostics from CVODE
   int nsteps{0};

@@ -26,6 +26,7 @@
 
 #include "bout/build_defines.hxx"
 #include <cstddef>
+#include <cstdio>
 
 #include "cvode.hxx"
 
@@ -88,6 +89,73 @@ int cvode_pre(BoutReal t, N_Vector yy, N_Vector yp, N_Vector rvec, N_Vector zvec
 
 int cvode_jac(N_Vector v, N_Vector Jv, BoutReal t, N_Vector y, N_Vector fy,
               void* user_data, N_Vector tmp);
+
+/// Saves the first N right-hand sides that CVODE passes to SPGMR. SUNDIALS
+/// calls the solver through a function pointer with no user data, so the
+/// state lives here; one CVODE solver per run.
+///
+/// Each record is 8 header values, then b, the error weights and the state y,
+/// each in local row order:
+///   t, gamma, tol, h, q, nsteps, nniters, nlocal, b[nlocal], w[nlocal], y[nlocal]
+/// tol is the delta SPGMR stops at: |w * P^-1 r|_2 < tol with left
+/// preconditioning. y is the current Newton iterate.
+struct LinearRhsRecorder {
+  int remaining{0};
+  void* cvode_mem{nullptr};
+  int (*solve)(SUNLinearSolver, SUNMatrix, N_Vector, N_Vector, sunrealtype){nullptr};
+  std::FILE* file{nullptr};
+};
+LinearRhsRecorder linear_rhs_recorder;
+
+void writeArray(std::FILE* file, N_Vector v, sunindextype n) {
+  const sunrealtype* data = N_VGetArrayPointer(v);
+  if (data == nullptr) {
+    throw BoutException("solver:save_linear_rhs needs a vector with local data");
+  }
+  std::fwrite(data, sizeof(sunrealtype), n, file);
+}
+
+int recordingSolve(SUNLinearSolver S, SUNMatrix A, N_Vector x, N_Vector b,
+                   sunrealtype tol) {
+  auto& rec = linear_rhs_recorder;
+  if (rec.remaining > 0) {
+    sunrealtype t{0}, gamma{0}, h{0};
+    int q{0};
+    long nsteps{0}, nniters{0};
+    N_Vector y{nullptr};
+    CVodeGetCurrentTime(rec.cvode_mem, &t);
+    CVodeGetCurrentGamma(rec.cvode_mem, &gamma);
+    CVodeGetCurrentStep(rec.cvode_mem, &h);
+    CVodeGetCurrentOrder(rec.cvode_mem, &q);
+    CVodeGetNumSteps(rec.cvode_mem, &nsteps);
+    CVodeGetNumNonlinSolvIters(rec.cvode_mem, &nniters);
+    CVodeGetCurrentState(rec.cvode_mem, &y);
+    // CVODE sets the scaling vectors to its error weights before each solve
+    N_Vector w = static_cast<SUNLinearSolverContent_SPGMR>(S->content)->s1;
+    if (w == nullptr) {
+      throw BoutException("solver:save_linear_rhs: SPGMR has no scaling vector");
+    }
+    const sunindextype n = N_VGetLocalLength(b);
+    const sunrealtype header[8] = {t,
+                                   gamma,
+                                   tol,
+                                   h,
+                                   static_cast<sunrealtype>(q),
+                                   static_cast<sunrealtype>(nsteps),
+                                   static_cast<sunrealtype>(nniters),
+                                   static_cast<sunrealtype>(n)};
+    std::fwrite(header, sizeof(sunrealtype), 8, rec.file);
+    writeArray(rec.file, b, n);
+    writeArray(rec.file, w, n);
+    writeArray(rec.file, y, n);
+    std::fflush(rec.file);
+    if (--rec.remaining == 0) {
+      std::fclose(rec.file);
+      rec.file = nullptr;
+    }
+  }
+  return rec.solve(S, A, x, b, tol);
+}
 } // namespace
 // NOLINTEND(readability-identifier-length)
 
@@ -180,6 +248,11 @@ CvodeSolver::CvodeSolver(Options* opts)
           (*options)["jacobian_export_trigger"]
               .doc("When to save CVODE Jacobians: output or linear_setup")
               .withDefault(bout::CvodeJacobianExportTrigger::linear_setup)),
+      save_linear_rhs((*options)["save_linear_rhs"]
+                          .doc("Save the right-hand side b, error weights and state "
+                               "of the first N GMRES solves to datadir, one "
+                               "linear_rhs.<rank>.bin per processor. 0 saves none.")
+                          .withDefault(0)),
       suncontext(createSUNContext(BoutComm::get())) {
   supports_constraints = false; // This solver doesn't have constraints
   canReset = true;
@@ -578,6 +651,30 @@ int CvodeSolver::init() {
     }
     if (CVodeSetLinearSolver(cvode_mem, sun_solver, nullptr) != CVLS_SUCCESS) {
       throw BoutException("CVodeSetLinearSolver failed\n");
+    }
+
+    if (save_linear_rhs > 0) {
+      if (SUNLinSolGetID(sun_solver) != SUNLINEARSOLVER_SPGMR) {
+        throw BoutException("solver:save_linear_rhs needs linear_solver = gmres");
+      }
+      if (nvector_type == NVectorType::ManyVector) {
+        throw BoutException("solver:save_linear_rhs needs nvector = sundials");
+      }
+      const std::string datadir = Options::root()["datadir"];
+      const std::string filename =
+          fmt::format("{}/linear_rhs.{}.bin", datadir, BoutComm::rank());
+      auto& rec = linear_rhs_recorder;
+      rec.file = std::fopen(filename.c_str(), "wb");
+      if (rec.file == nullptr) {
+        throw BoutException("solver:save_linear_rhs could not open {}", filename);
+      }
+      rec.remaining = save_linear_rhs;
+      rec.cvode_mem = cvode_mem;
+      // Swap SPGMR's solve for one that saves b first
+      rec.solve = sun_solver->ops->solve;
+      sun_solver->ops->solve = recordingSolve;
+      output_info.write("\tSaving the first {} linear right-hand sides to {}\n",
+                        save_linear_rhs, filename);
     }
 
 #if SUNDIALS_VERSION_MAJOR >= 6
