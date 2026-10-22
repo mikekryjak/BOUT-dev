@@ -115,6 +115,9 @@ private:
   /// Give each PCSHELL in ``pc``, or among the preconditioners of a
   /// PCCOMPOSITE ``pc``, the user preconditioner; count them in ``nshells``.
   PetscErrorCode attachUserShells(PC pc, int& nshells);
+  /// Set ``petsc_shell_mask``: 1 on the rows of the comma-separated evolved
+  /// ``fields``, 0 on all others, ``nlocal`` rows in the solver's order.
+  void makeShellMask(const std::string& fields, int nlocal);
   /// Write one Jacobian matrix and the shared metadata JSON.
   void exportMatrixAndMetadata(bout::JacobianExportKind kind, Mat jacobian);
   /// Build and save a diagnostic Jacobian of the requested kind.
@@ -234,6 +237,8 @@ private:
   BoutReal petsc_shell_gamma{0.0};
   BoutReal petsc_shell_delta{0.0};
   BoutReal* petsc_shell_y{nullptr};
+  /// The shell's output is multiplied by this; empty means all rows kept
+  std::vector<BoutReal> petsc_shell_mask;
 #endif
 };
 

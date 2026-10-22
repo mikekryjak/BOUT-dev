@@ -53,6 +53,7 @@
 #include "bout/solver.hxx"
 #include "bout/sundials_backports.hxx"
 #include "bout/unused.hxx"
+#include "bout/utils.hxx"
 
 #include "fmt/core.h"
 #include "fmt/format.h"
@@ -69,6 +70,7 @@
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -739,6 +741,21 @@ int CvodeSolver::init() {
           output_info.write("\tPETSc preconditioner runs the user preconditioner in "
                             "{:d} shell(s)\n",
                             nshells);
+
+          // In a composite, a row the user preconditioner passes through unchanged
+          // adds the raw residual as a correction; listing the fields it
+          // preconditions makes the shell return zero on all other rows.
+          const auto shell_fields =
+              (*options)["cvode_petsc_shell_fields"]
+                  .doc("Comma-separated evolved fields on which the user "
+                       "preconditioner shell returns its result; it returns zero on "
+                       "all others. Empty: all rows, as the user preconditioner "
+                       "leaves them.")
+                  .withDefault<std::string>("");
+          if (!shell_fields.empty()) {
+            makeShellMask(shell_fields, local_N);
+            output_info.write("\tShell result kept only on fields: {:s}\n", shell_fields);
+          }
         }
       }
 
@@ -1339,6 +1356,10 @@ PetscErrorCode CvodeSolver::petscUserShellApply(PC pc, Vec x, Vec y) {
   s->save_vars(s->petsc_shell_y);
   s->save_derivs(ydata);
 
+  for (std::size_t i = 0; i < s->petsc_shell_mask.size(); ++i) {
+    ydata[i] *= s->petsc_shell_mask[i];
+  }
+
   PetscCall(VecRestoreArray(y, &ydata));
   PetscCall(VecRestoreArrayRead(x, &xdata));
 
@@ -1371,6 +1392,41 @@ PetscErrorCode CvodeSolver::attachUserShells(PC pc, int& nshells) {
     }
   }
   return PETSC_SUCCESS;
+}
+
+void CvodeSolver::makeShellMask(const std::string& fields, int nlocal) {
+  std::set<std::string> names;
+  for (const auto& name : strsplit(fields, ',')) {
+    names.insert(trim(name));
+  }
+
+  // 1 in the time derivatives of the listed fields, 0 in all others; the rhs
+  // overwrites these before they are next used.
+  std::set<std::string> found;
+  for (const auto& f : f2d) {
+    const bool keep = names.count(f.name) > 0;
+    *f.F_var = keep ? 1.0 : 0.0;
+    if (keep) {
+      found.insert(f.name);
+    }
+  }
+  for (const auto& f : f3d) {
+    const bool keep = names.count(f.name) > 0;
+    *f.F_var = keep ? 1.0 : 0.0;
+    if (keep) {
+      found.insert(f.name);
+    }
+  }
+  for (const auto& name : names) {
+    if (found.count(name) == 0) {
+      throw BoutException("solver:cvode_petsc_shell_fields names '{:s}', which is not "
+                          "an evolved field",
+                          name);
+    }
+  }
+
+  petsc_shell_mask.resize(nlocal);
+  save_derivs(petsc_shell_mask.data());
 }
 #endif
 
