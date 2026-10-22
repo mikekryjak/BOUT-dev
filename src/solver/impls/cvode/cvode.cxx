@@ -94,11 +94,14 @@ int cvode_jac(N_Vector v, N_Vector Jv, BoutReal t, N_Vector y, N_Vector fy,
 /// calls the solver through a function pointer with no user data, so the
 /// state lives here; one CVODE solver per run.
 ///
-/// Each record is 8 header values, then b, the error weights and the state y,
+/// Each record is 9 header values, then b, the error weights and the state y,
 /// each in local row order:
-///   t, gamma, tol, h, q, nsteps, nniters, nlocal, b[nlocal], w[nlocal], y[nlocal]
+///   t, gamma, tol, h, q, nsteps, nniters, nliters, nlocal,
+///   b[nlocal], w[nlocal], y[nlocal]
 /// tol is the delta SPGMR stops at: |w * P^-1 r|_2 < tol with left
-/// preconditioning. y is the current Newton iterate.
+/// preconditioning. y is the current Newton iterate. nliters counts the linear
+/// iterations before this solve, so the next record's minus this one's is
+/// this solve's count.
 struct LinearRhsRecorder {
   int remaining{0};
   void* cvode_mem{nullptr};
@@ -121,7 +124,7 @@ int recordingSolve(SUNLinearSolver S, SUNMatrix A, N_Vector x, N_Vector b,
   if (rec.remaining > 0) {
     sunrealtype t{0}, gamma{0}, h{0};
     int q{0};
-    long nsteps{0}, nniters{0};
+    long nsteps{0}, nniters{0}, nliters{0};
     N_Vector y{nullptr};
     CVodeGetCurrentTime(rec.cvode_mem, &t);
     CVodeGetCurrentGamma(rec.cvode_mem, &gamma);
@@ -129,6 +132,7 @@ int recordingSolve(SUNLinearSolver S, SUNMatrix A, N_Vector x, N_Vector b,
     CVodeGetCurrentOrder(rec.cvode_mem, &q);
     CVodeGetNumSteps(rec.cvode_mem, &nsteps);
     CVodeGetNumNonlinSolvIters(rec.cvode_mem, &nniters);
+    CVodeGetNumLinIters(rec.cvode_mem, &nliters);
     CVodeGetCurrentState(rec.cvode_mem, &y);
     // CVODE sets the scaling vectors to its error weights before each solve
     N_Vector w = static_cast<SUNLinearSolverContent_SPGMR>(S->content)->s1;
@@ -136,15 +140,16 @@ int recordingSolve(SUNLinearSolver S, SUNMatrix A, N_Vector x, N_Vector b,
       throw BoutException("solver:save_linear_rhs: SPGMR has no scaling vector");
     }
     const sunindextype n = N_VGetLocalLength(b);
-    const sunrealtype header[8] = {t,
+    const sunrealtype header[9] = {t,
                                    gamma,
                                    tol,
                                    h,
                                    static_cast<sunrealtype>(q),
                                    static_cast<sunrealtype>(nsteps),
                                    static_cast<sunrealtype>(nniters),
+                                   static_cast<sunrealtype>(nliters),
                                    static_cast<sunrealtype>(n)};
-    std::fwrite(header, sizeof(sunrealtype), 8, rec.file);
+    std::fwrite(header, sizeof(sunrealtype), 9, rec.file);
     writeArray(rec.file, b, n);
     writeArray(rec.file, w, n);
     writeArray(rec.file, y, n);
