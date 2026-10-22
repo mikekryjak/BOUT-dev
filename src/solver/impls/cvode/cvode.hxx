@@ -109,6 +109,12 @@ private:
   static int petscPSolve(BoutReal t, N_Vector yy, N_Vector yp, N_Vector rvec,
                          N_Vector zvec, BoutReal gamma, BoutReal delta, int lr,
                          void* user_data);
+  /// PETSc PCSHELL apply: run the user preconditioner, as ``pre`` does, at the
+  /// state, time and gamma of the current ``petscPSolve``.
+  static PetscErrorCode petscUserShellApply(PC pc, Vec x, Vec y);
+  /// Give each PCSHELL in ``pc``, or among the preconditioners of a
+  /// PCCOMPOSITE ``pc``, the user preconditioner; count them in ``nshells``.
+  PetscErrorCode attachUserShells(PC pc, int& nshells);
   /// Write one Jacobian matrix and the shared metadata JSON.
   void exportMatrixAndMetadata(bout::JacobianExportKind kind, Mat jacobian);
   /// Build and save a diagnostic Jacobian of the requested kind.
@@ -223,6 +229,11 @@ private:
   BoutReal petsc_gamma{0.0};
   BoutReal petsc_t{0.0};
   std::vector<BoutReal> petsc_rhs_tmp;
+  // Arguments of the current petscPSolve, for the user preconditioner shell
+  BoutReal petsc_shell_t{0.0};
+  BoutReal petsc_shell_gamma{0.0};
+  BoutReal petsc_shell_delta{0.0};
+  BoutReal* petsc_shell_y{nullptr};
 #endif
 };
 

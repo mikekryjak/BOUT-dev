@@ -723,6 +723,23 @@ int CvodeSolver::init() {
         PetscCall(KSPSetType(petsc_ksp, KSPPREONLY));
         PetscCall(KSPSetOptionsPrefix(petsc_ksp, "cvode_petscpre_"));
         PetscCall(KSPSetFromOptions(petsc_ksp));
+
+        // A PCSHELL, alone or in a PCCOMPOSITE, runs the user preconditioner,
+        // e.g. pc_type = composite, pc_composite_pcs = bjacobi,shell
+        PC pc = nullptr;
+        PetscCall(KSPGetPC(petsc_ksp, &pc));
+        int nshells = 0;
+        PetscCall(attachUserShells(pc, nshells));
+        if (nshells > 0) {
+          if (!hasPreconditioner()) {
+            throw BoutException(
+                "solver:cvode_precon_method=petsc has a shell preconditioner, but "
+                "no user preconditioner has been supplied.");
+          }
+          output_info.write("\tPETSc preconditioner runs the user preconditioner in "
+                            "{:d} shell(s)\n",
+                            nshells);
+        }
       }
 
       if (petsc_x == nullptr) {
@@ -1274,10 +1291,16 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
   return 0;
 }
 
-int CvodeSolver::petscPSolve(BoutReal UNUSED(t), N_Vector UNUSED(yy), N_Vector UNUSED(yp),
-                             N_Vector rvec, N_Vector zvec, BoutReal UNUSED(gamma),
-                             BoutReal UNUSED(delta), int UNUSED(lr), void* user_data) {
+int CvodeSolver::petscPSolve(BoutReal t, N_Vector yy, N_Vector UNUSED(yp), N_Vector rvec,
+                             N_Vector zvec, BoutReal gamma, BoutReal delta,
+                             int UNUSED(lr), void* user_data) {
   auto* s = static_cast<CvodeSolver*>(user_data);
+
+  // For a user preconditioner shell, which PETSc calls without these
+  s->petsc_shell_t = t;
+  s->petsc_shell_gamma = gamma;
+  s->petsc_shell_delta = delta;
+  s->petsc_shell_y = N_VGetArrayPointer(yy);
 
   auto* rdata = N_VGetArrayPointer(rvec);
   auto* zdata = N_VGetArrayPointer(zvec);
@@ -1294,6 +1317,60 @@ int CvodeSolver::petscPSolve(BoutReal UNUSED(t), N_Vector UNUSED(yy), N_Vector U
   VecResetArray(s->petsc_z);
 
   return ierr == 0 ? 0 : 1;
+}
+
+PetscErrorCode CvodeSolver::petscUserShellApply(PC pc, Vec x, Vec y) {
+  CvodeSolver* s = nullptr;
+  PetscCall(PCShellGetContext(pc, &s));
+
+  const BoutReal tstart = bout::globals::mpi->MPI_Wtime();
+
+  const BoutReal* xdata = nullptr;
+  BoutReal* ydata = nullptr;
+  PetscCall(VecGetArrayRead(x, &xdata));
+  PetscCall(VecGetArray(y, &ydata));
+
+  // As CvodeSolver::pre: load the state, then the vector to be inverted
+  s->load_vars(s->petsc_shell_y);
+  s->load_derivs(const_cast<BoutReal*>(xdata));
+
+  s->runPreconditioner(s->petsc_shell_t, s->petsc_shell_gamma, s->petsc_shell_delta);
+
+  s->save_vars(s->petsc_shell_y);
+  s->save_derivs(ydata);
+
+  PetscCall(VecRestoreArray(y, &ydata));
+  PetscCall(VecRestoreArrayRead(x, &xdata));
+
+  s->pre_Wtime += bout::globals::mpi->MPI_Wtime() - tstart;
+  s->pre_ncalls++;
+
+  return PETSC_SUCCESS;
+}
+
+PetscErrorCode CvodeSolver::attachUserShells(PC pc, int& nshells) {
+  PetscBool is_shell = PETSC_FALSE;
+  PetscBool is_composite = PETSC_FALSE;
+  PetscCall(
+      PetscObjectTypeCompare(reinterpret_cast<PetscObject>(pc), PCSHELL, &is_shell));
+  PetscCall(PetscObjectTypeCompare(reinterpret_cast<PetscObject>(pc), PCCOMPOSITE,
+                                   &is_composite));
+
+  if (is_shell) {
+    PetscCall(PCShellSetContext(pc, this));
+    PetscCall(PCShellSetApply(pc, petscUserShellApply));
+    PetscCall(PCShellSetName(pc, "BOUT++ user preconditioner"));
+    nshells++;
+  } else if (is_composite) {
+    PetscInt npc = 0;
+    PetscCall(PCCompositeGetNumberPC(pc, &npc));
+    for (PetscInt i = 0; i < npc; ++i) {
+      PC sub = nullptr;
+      PetscCall(PCCompositeGetPC(pc, i, &sub));
+      PetscCall(attachUserShells(sub, nshells));
+    }
+  }
+  return PETSC_SUCCESS;
 }
 #endif
 
