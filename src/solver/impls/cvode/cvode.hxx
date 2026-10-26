@@ -112,6 +112,15 @@ private:
   /// PETSc PCSHELL apply: run the user preconditioner, as ``pre`` does, at the
   /// state, time and gamma of the current ``petscPSolve``.
   static PetscErrorCode petscUserShellApply(PC pc, Vec x, Vec y);
+  /// solver:cvode_petsc_mf_residual: the MatShell product
+  /// ``v - gamma (f(y + sigma v) - f(y)) / sigma``, CVODE's operator by its own
+  /// difference quotient (sigma v of weighted RMS size 1), at the state, gamma
+  /// and error weights of the last setup; then the rhs at y again, so the user
+  /// preconditioner sees the state it would have seen without this product
+  static PetscErrorCode petscMfResidualMult(Mat A, Vec v, Vec out);
+  /// Store the state, its rhs, gamma and the error weights that
+  /// ``petscMfResidualMult`` uses; nonzero if the rhs fails
+  int petscMfResidualSetup(BoutReal t, const BoutReal* y, BoutReal gamma);
   /// Give each PCSHELL in ``pc``, or among the preconditioners of a
   /// PCCOMPOSITE ``pc``, the user preconditioner; count them in ``nshells``.
   PetscErrorCode attachUserShells(PC pc, int& nshells);
@@ -258,6 +267,17 @@ private:
   std::vector<int> petsc_check_field;
   std::vector<std::string> petsc_check_names;
   int petsc_check_failures{0};
+  /// solver:cvode_petsc_mf_residual: the composite's operator (Amat) is
+  /// ``petsc_mf_matrix``, a MatShell, rather than the coloured matrix
+  bool petsc_mf_residual{false};
+  Mat petsc_mf_matrix{nullptr};
+  BoutReal petsc_mf_t{0.0};
+  BoutReal petsc_mf_gamma{0.0};
+  std::vector<BoutReal> petsc_mf_y;  ///< state of the last setup
+  std::vector<BoutReal> petsc_mf_f;  ///< rhs at that state
+  std::vector<BoutReal> petsc_mf_w;  ///< CVODE's error weights at that setup
+  std::vector<BoutReal> petsc_mf_yv; ///< y + sigma v
+  std::vector<BoutReal> petsc_mf_fv; ///< rhs at y + sigma v
 #endif
 };
 

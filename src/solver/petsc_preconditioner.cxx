@@ -44,8 +44,10 @@ private:
 
 public:
   static auto getOffsets(int n_square, int n_taxi, int n_cross) {
-    ASSERT2(n_square >= 0 && n_cross >= 0 && n_taxi >= 0
-            && n_square + n_cross + n_taxi > 0);
+    // All three 0 (stencil:taxi = 0 set explicitly) leaves each cell alone: the
+    // pattern is the cell blocks, coloured in one colour per field, so the
+    // finite differences probe each block with its neighbours' terms lumped in
+    ASSERT2(n_square >= 0 && n_cross >= 0 && n_taxi >= 0);
     auto inside = [&](int i, int j) {
       return isInSquare(i, j, n_square) || isInTaxi(i, j, n_taxi)
              || isInCross(i, j, n_cross);

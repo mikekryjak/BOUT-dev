@@ -324,6 +324,9 @@ CvodeSolver::~CvodeSolver() {
     if (petsc_jac_computed != nullptr) {
       MatDestroy(&petsc_jac_computed);
     }
+    if (petsc_mf_matrix != nullptr) {
+      MatDestroy(&petsc_mf_matrix);
+    }
 #endif
   }
 }
@@ -767,6 +770,26 @@ int CvodeSolver::init() {
             makeShellMask(shell_fields, local_N);
             output_info.write("\tShell result kept only on fields: {:s}\n", shell_fields);
           }
+        }
+
+        // A multiplicative composite computes its leftover x - A B x with the
+        // operator A; by default that is the coloured matrix
+        petsc_mf_residual =
+            (*options)["cvode_petsc_mf_residual"]
+                .doc("With cvode_precon_method=petsc, give the top preconditioner "
+                     "CVODE's matrix-free operator v - gamma (f(y + sigma v) - "
+                     "f(y)) / sigma as its Amat, so a composite's leftover uses "
+                     "it rather than the coloured matrix")
+                .withDefault(false);
+        if (petsc_mf_residual) {
+          PetscCall(MatCreateShell(BoutComm::get(), local_N, local_N, petsc_global_N,
+                                   petsc_global_N, this, &petsc_mf_matrix));
+          PetscCall(MatShellSetOperation(
+              petsc_mf_matrix, MATOP_MULT,
+              reinterpret_cast<void (*)(void)>(CvodeSolver::petscMfResidualMult)));
+          PetscCall(PCSetUseAmat(pc, PETSC_TRUE));
+          output_info.write("\tPETSc preconditioner's Amat is CVODE's matrix-free "
+                            "operator\n");
         }
       }
 
@@ -1287,8 +1310,12 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
     if (ierr == 0) {
       ierr = MatShift(J, 1.0 - ratio);
     }
+    if (ierr == 0 and s->petsc_mf_residual) {
+      ierr = s->petscMfResidualSetup(t, N_VGetArrayPointer(yy), gamma);
+    }
     if (ierr == 0) {
-      ierr = KSPSetOperators(s->petsc_ksp, J, J);
+      ierr = KSPSetOperators(s->petsc_ksp, s->petsc_mf_residual ? s->petsc_mf_matrix : J,
+                             J);
     }
     if (ierr == 0) {
       ierr = KSPSetUp(s->petsc_ksp);
@@ -1358,7 +1385,13 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
   }
   s->petsc_jac_gamma = gamma;
 
-  ierr = KSPSetOperators(s->petsc_ksp, J, J);
+  if (s->petsc_mf_residual) {
+    ierr = s->petscMfResidualSetup(t, ydata, gamma);
+  }
+  if (ierr == 0) {
+    ierr = KSPSetOperators(s->petsc_ksp, s->petsc_mf_residual ? s->petsc_mf_matrix : J,
+                           J);
+  }
   if (ierr == 0) {
     ierr = KSPSetUp(s->petsc_ksp);
   }
@@ -1463,6 +1496,77 @@ PetscErrorCode CvodeSolver::petscUserShellApply(PC pc, Vec x, Vec y) {
   s->pre_ncalls++;
 
   return PETSC_SUCCESS;
+}
+
+int CvodeSolver::petscMfResidualSetup(BoutReal t, const BoutReal* y, BoutReal gamma) {
+  const auto n = petsc_rhs_tmp.size();
+  petsc_mf_t = t;
+  petsc_mf_gamma = gamma;
+  petsc_mf_y.assign(y, y + n);
+  petsc_mf_f.resize(n);
+  petsc_mf_yv.resize(n);
+  petsc_mf_fv.resize(n);
+
+  N_Vector weights = N_VClone(uvec);
+  CVodeGetErrWeights(cvode_mem, weights);
+  const BoutReal* w = N_VGetArrayPointer(weights);
+  petsc_mf_w.assign(w, w + n);
+  N_VDestroy(weights);
+
+  try {
+    rhs(t, petsc_mf_y.data(), petsc_mf_f.data(), true);
+  } catch (BoutRhsFail&) {
+    return 1;
+  }
+  return 0;
+}
+
+PetscErrorCode CvodeSolver::petscMfResidualMult(Mat A, Vec v, Vec out) {
+  CvodeSolver* s = nullptr;
+  PetscCall(MatShellGetContext(A, &s));
+  const auto n = s->petsc_mf_y.size();
+
+  const BoutReal* vdata = nullptr;
+  BoutReal* odata = nullptr;
+  PetscCall(VecGetArrayRead(v, &vdata));
+  PetscCall(VecGetArray(out, &odata));
+
+  // CVODE's sigma: sigma v has weighted RMS size 1
+  BoutReal local_sum = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    local_sum += SQ(s->petsc_mf_w[i] * vdata[i]);
+  }
+  BoutReal sum = 0.0;
+  bout::globals::mpi->MPI_Allreduce(&local_sum, &sum, 1, MPI_DOUBLE, MPI_SUM,
+                                    BoutComm::get());
+
+  int failed = 0;
+  if (sum > 0.0) {
+    const BoutReal sigma =
+        1.0 / std::sqrt(sum / static_cast<BoutReal>(s->petsc_global_N));
+    for (std::size_t i = 0; i < n; ++i) {
+      s->petsc_mf_yv[i] = s->petsc_mf_y[i] + sigma * vdata[i];
+    }
+    try {
+      s->rhs(s->petsc_mf_t, s->petsc_mf_yv.data(), s->petsc_mf_fv.data(), true);
+      for (std::size_t i = 0; i < n; ++i) {
+        odata[i] = vdata[i]
+                   - s->petsc_mf_gamma * (s->petsc_mf_fv[i] - s->petsc_mf_f[i]) / sigma;
+      }
+      // Back to the state at y; the result is f(y) again, so discard it
+      s->rhs(s->petsc_mf_t, s->petsc_mf_y.data(), s->petsc_mf_fv.data(), true);
+    } catch (BoutRhsFail&) {
+      failed = 1;
+    }
+  } else {
+    for (std::size_t i = 0; i < n; ++i) {
+      odata[i] = 0.0;
+    }
+  }
+
+  PetscCall(VecRestoreArray(out, &odata));
+  PetscCall(VecRestoreArrayRead(v, &vdata));
+  return failed == 0 ? PETSC_SUCCESS : PETSC_ERR_NOT_CONVERGED;
 }
 
 PetscErrorCode CvodeSolver::attachUserShells(PC pc, int& nshells) {
