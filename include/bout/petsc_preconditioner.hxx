@@ -33,6 +33,7 @@ BOUT_ENUM_CLASS_NS(
 #include <petscvec.h>
 
 #include <string>
+#include <vector>
 
 class Options;
 class Field3D;
@@ -59,16 +60,24 @@ public:
   /// for the currently stored `Jfd` matrix.
   template <class ColoringFunction>
   PetscErrorCode updateColoring(ColoringFunction function, void* ctx) {
-    // Re-calculate the coloring
-    MatColoring coloring{nullptr};
-    PetscCall(MatColoringCreate(Jfd, &coloring));
-    PetscCall(MatColoringSetType(coloring, MATCOLORINGGREEDY));
-    PetscCall(MatColoringSetFromOptions(coloring));
-
-    // Calculate new index sets
     ISColoring iscoloring{nullptr};
-    PetscCall(MatColoringApply(coloring, &iscoloring));
-    PetscCall(MatColoringDestroy(&coloring));
+    if (line_colors.empty()) {
+      // Re-calculate the coloring
+      MatColoring coloring{nullptr};
+      PetscCall(MatColoringCreate(Jfd, &coloring));
+      PetscCall(MatColoringSetType(coloring, MATCOLORINGGREEDY));
+      PetscCall(MatColoringSetFromOptions(coloring));
+
+      // Calculate new index sets
+      PetscCall(MatColoringApply(coloring, &iscoloring));
+      PetscCall(MatColoringDestroy(&coloring));
+    } else {
+      // stencil:yline fixes the colours itself, so that couplings along x and z
+      // add into the column of the same position along y
+      PetscCall(ISColoringCreate(PetscObjectComm(reinterpret_cast<PetscObject>(Jfd)),
+                                 n_line_colors, static_cast<PetscInt>(line_colors.size()),
+                                 line_colors.data(), PETSC_COPY_VALUES, &iscoloring));
+    }
 
     // Replace the old coloring with the new one
     PetscCall(MatFDColoringDestroy(&fdcoloring));
@@ -104,6 +113,9 @@ public:
 private:
   Mat Jfd{nullptr};
   MatFDColoring fdcoloring{nullptr};
+  /// Colour of each local row under stencil:yline; empty for a greedy colouring
+  std::vector<ISColoringValue> line_colors;
+  PetscInt n_line_colors{0};
 };
 
 #else

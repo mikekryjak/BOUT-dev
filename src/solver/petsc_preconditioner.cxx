@@ -63,6 +63,15 @@ public:
     }
     return xy_offsets;
   }
+
+  /// Offsets along y only, for stencil:yline
+  static auto getYOffsets(int n_yline) {
+    std::vector<std::pair<int, int>> xy_offsets;
+    for (int j = -n_yline; j <= n_yline; ++j) {
+      xy_offsets.emplace_back(0, j);
+    }
+    return xy_offsets;
+  }
 };
 } // namespace
 
@@ -71,6 +80,8 @@ void PetscPreconditioner::reset() {
     MatFDColoringDestroy(&fdcoloring);
     fdcoloring = nullptr;
   }
+  line_colors.clear();
+  n_line_colors = 0;
   if (Jfd != nullptr) {
     MatDestroy(&Jfd);
     Jfd = nullptr;
@@ -138,12 +149,27 @@ PetscErrorCode PetscPreconditioner::createJacobianPattern(Field3D& index,
       options["stencil:square"].doc("Extent of stencil (square)").withDefault<int>(0);
   auto n_cross =
       options["stencil:cross"].doc("Extent of stencil (cross)").withDefault<int>(0);
+  auto n_yline = options["stencil:yline"]
+                     .doc("Extent of stencil along y only. Couplings along x and z add "
+                          "into the column at the same position along y")
+                     .withDefault<int>(0);
   // Default n_taxi=2 if nothing else is set
-  auto n_taxi = options["stencil:taxi"]
-                    .doc("Extent of stencil (taxi-cab norm)")
-                    .withDefault<int>((n_square == 0 && n_cross == 0) ? 2 : 0);
+  auto n_taxi =
+      options["stencil:taxi"]
+          .doc("Extent of stencil (taxi-cab norm)")
+          .withDefault<int>((n_square == 0 && n_cross == 0 && n_yline == 0) ? 2 : 0);
+  if (n_yline > 0 && (n_square > 0 || n_cross > 0 || n_taxi > 0)) {
+    throw BoutException("stencil:yline cannot be combined with stencil:square, "
+                        "stencil:cross or stencil:taxi");
+  }
+  if (n_yline > mesh->ystart) {
+    throw BoutException("stencil:yline = {:d} reaches past the {:d} guard cells along y",
+                        n_yline, mesh->ystart);
+  }
 
-  const auto xy_offsets = ColoringStencil::getOffsets(n_square, n_taxi, n_cross);
+  const auto xy_offsets = (n_yline > 0)
+                              ? ColoringStencil::getYOffsets(n_yline)
+                              : ColoringStencil::getOffsets(n_square, n_taxi, n_cross);
   {
     // Count the *unique* non-zeros for preallocation
     std::vector<std::set<int>> d_nnz_map2d(nlocal);
@@ -305,6 +331,9 @@ PetscErrorCode PetscPreconditioner::createJacobianPattern(Field3D& index,
             }
 
             for (int zi = mesh->zstart; zi <= mesh->zend; ++zi) {
+              if (n_yline > 0 && zi != z) {
+                continue; // Couplings along z add into the same z
+              }
               int ind2 = ROUND(index(xi, yi, zi));
               if (ind2 < 0) {
                 continue; // Boundary point
@@ -323,6 +352,63 @@ PetscErrorCode PetscPreconditioner::createJacobianPattern(Field3D& index,
         }
       }
     }
+  }
+
+  if (n_yline > 0) {
+    // One colour per variable and position along y, the same at every x and z.
+    // Perturbing one colour then reaches each row through one column of its
+    // pattern, so that column takes the row's couplings along x and z as well.
+    const int period = (2 * n_yline) + 1;
+    const int nvars = n2d + n3d;
+
+    // The positions must continue across processors and branch cuts, as the
+    // guard cells show after a communication
+    Field3D position{0.0, mesh};
+    for (int x = mesh->xstart; x <= mesh->xend; x++) {
+      for (int y = mesh->ystart; y <= mesh->yend; y++) {
+        for (int z = mesh->zstart; z <= mesh->zend; z++) {
+          position(x, y, z) = (y - mesh->ystart) % period;
+        }
+      }
+    }
+    mesh->communicate(position);
+    for (int x = mesh->xstart; x <= mesh->xend; x++) {
+      for (int y = mesh->ystart; y <= mesh->yend; y++) {
+        for (const auto& [x_off, y_off] : xy_offsets) {
+          const int yi = y + y_off;
+          if (ROUND(index(x, yi, 0)) < 0) {
+            continue; // A boundary point
+          }
+          const int expected = ((y - mesh->ystart) % period + y_off + period) % period;
+          if (ROUND(position(x, yi, 0)) != expected) {
+            throw BoutException("stencil:yline = {:d}: positions along y do not continue "
+                                "at x = {:d}, y = {:d}; each processor needs a multiple "
+                                "of {:d} cells along y",
+                                n_yline, x, yi, period);
+          }
+        }
+      }
+    }
+
+    line_colors.assign(nlocal, 0);
+    for (int x = mesh->xstart; x <= mesh->xend; x++) {
+      for (int y = mesh->ystart; y <= mesh->yend; y++) {
+        const int offset = nvars * ((y - mesh->ystart) % period);
+        const int ind0 = ROUND(index(x, y, 0)) - Istart;
+        for (int i = 0; i < n2d; i++) {
+          line_colors[ind0 + i] = static_cast<ISColoringValue>(offset + i);
+        }
+        for (int z = mesh->zstart; z <= mesh->zend; z++) {
+          const int ind = ROUND(index(x, y, z)) - Istart;
+          for (int i = 0; i < n3d; i++) {
+            const int row = ind + i + ((z == 0) ? n2d : 0);
+            line_colors[row] = static_cast<ISColoringValue>(offset + n2d + i);
+          }
+        }
+      }
+    }
+    n_line_colors = nvars * period;
+    output_info.write("\tJacobian coloured along y only: {:d} colours\n", n_line_colors);
   }
 
   output_progress.write("Assembling Jacobian matrix\n");
