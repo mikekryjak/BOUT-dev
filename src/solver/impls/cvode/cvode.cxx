@@ -327,6 +327,9 @@ CvodeSolver::~CvodeSolver() {
     if (petsc_mf_matrix != nullptr) {
       MatDestroy(&petsc_mf_matrix);
     }
+    if (petsc_mf_weights != nullptr) {
+      N_VDestroy(petsc_mf_weights);
+    }
 #endif
   }
 }
@@ -1310,9 +1313,6 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
     if (ierr == 0) {
       ierr = MatShift(J, 1.0 - ratio);
     }
-    if (ierr == 0 and s->petsc_mf_residual) {
-      ierr = s->petscMfResidualSetup(t, N_VGetArrayPointer(yy), gamma);
-    }
     if (ierr == 0) {
       ierr = KSPSetOperators(s->petsc_ksp, s->petsc_mf_residual ? s->petsc_mf_matrix : J,
                              J);
@@ -1385,13 +1385,7 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
   }
   s->petsc_jac_gamma = gamma;
 
-  if (s->petsc_mf_residual) {
-    ierr = s->petscMfResidualSetup(t, ydata, gamma);
-  }
-  if (ierr == 0) {
-    ierr = KSPSetOperators(s->petsc_ksp, s->petsc_mf_residual ? s->petsc_mf_matrix : J,
-                           J);
-  }
+  ierr = KSPSetOperators(s->petsc_ksp, s->petsc_mf_residual ? s->petsc_mf_matrix : J, J);
   if (ierr == 0) {
     ierr = KSPSetUp(s->petsc_ksp);
   }
@@ -1498,33 +1492,29 @@ PetscErrorCode CvodeSolver::petscUserShellApply(PC pc, Vec x, Vec y) {
   return PETSC_SUCCESS;
 }
 
-int CvodeSolver::petscMfResidualSetup(BoutReal t, const BoutReal* y, BoutReal gamma) {
-  const auto n = petsc_rhs_tmp.size();
-  petsc_mf_t = t;
-  petsc_mf_gamma = gamma;
-  petsc_mf_y.assign(y, y + n);
-  petsc_mf_f.resize(n);
-  petsc_mf_yv.resize(n);
-  petsc_mf_fv.resize(n);
-
-  N_Vector weights = N_VClone(uvec);
-  CVodeGetErrWeights(cvode_mem, weights);
-  const BoutReal* w = N_VGetArrayPointer(weights);
-  petsc_mf_w.assign(w, w + n);
-  N_VDestroy(weights);
-
-  try {
-    rhs(t, petsc_mf_y.data(), petsc_mf_f.data(), true);
-  } catch (BoutRhsFail&) {
-    return 1;
-  }
-  return 0;
-}
-
 PetscErrorCode CvodeSolver::petscMfResidualMult(Mat A, Vec v, Vec out) {
   CvodeSolver* s = nullptr;
   PetscCall(MatShellGetContext(A, &s));
-  const auto n = s->petsc_mf_y.size();
+  PetscInt length = 0;
+  PetscCall(VecGetLocalSize(v, &length));
+  const auto n = static_cast<std::size_t>(length);
+  s->petsc_mf_f.resize(n);
+  s->petsc_mf_yv.resize(n);
+  s->petsc_mf_fv.resize(n);
+
+  // CVODE's current state, time and gamma, which petscPSolve stored for the
+  // user preconditioner shell; the rhs must run at the shell's time, since
+  // Hermes-3's preconditioner refuses a state set at another time
+  BoutReal* y = s->petsc_shell_y;
+  PetscCheck(y != nullptr, PETSC_COMM_SELF, PETSC_ERR_ORDER,
+             "cvode_petsc_mf_residual: product before the first preconditioner solve");
+  const BoutReal t = s->petsc_shell_t;
+  const BoutReal gamma = s->petsc_shell_gamma;
+  if (s->petsc_mf_weights == nullptr) {
+    s->petsc_mf_weights = N_VClone(s->uvec);
+  }
+  CVodeGetErrWeights(s->cvode_mem, s->petsc_mf_weights);
+  const BoutReal* w = N_VGetArrayPointer(s->petsc_mf_weights);
 
   const BoutReal* vdata = nullptr;
   BoutReal* odata = nullptr;
@@ -1534,7 +1524,7 @@ PetscErrorCode CvodeSolver::petscMfResidualMult(Mat A, Vec v, Vec out) {
   // CVODE's sigma: sigma v has weighted RMS size 1
   BoutReal local_sum = 0.0;
   for (std::size_t i = 0; i < n; ++i) {
-    local_sum += SQ(s->petsc_mf_w[i] * vdata[i]);
+    local_sum += SQ(w[i] * vdata[i]);
   }
   BoutReal sum = 0.0;
   bout::globals::mpi->MPI_Allreduce(&local_sum, &sum, 1, MPI_DOUBLE, MPI_SUM,
@@ -1545,16 +1535,15 @@ PetscErrorCode CvodeSolver::petscMfResidualMult(Mat A, Vec v, Vec out) {
     const BoutReal sigma =
         1.0 / std::sqrt(sum / static_cast<BoutReal>(s->petsc_global_N));
     for (std::size_t i = 0; i < n; ++i) {
-      s->petsc_mf_yv[i] = s->petsc_mf_y[i] + sigma * vdata[i];
+      s->petsc_mf_yv[i] = y[i] + sigma * vdata[i];
     }
     try {
-      s->rhs(s->petsc_mf_t, s->petsc_mf_yv.data(), s->petsc_mf_fv.data(), true);
+      s->rhs(t, s->petsc_mf_yv.data(), s->petsc_mf_fv.data(), true);
+      // f(y) last, so the user preconditioner then sees the state at y
+      s->rhs(t, y, s->petsc_mf_f.data(), true);
       for (std::size_t i = 0; i < n; ++i) {
-        odata[i] = vdata[i]
-                   - s->petsc_mf_gamma * (s->petsc_mf_fv[i] - s->petsc_mf_f[i]) / sigma;
+        odata[i] = vdata[i] - gamma * (s->petsc_mf_fv[i] - s->petsc_mf_f[i]) / sigma;
       }
-      // Back to the state at y; the result is f(y) again, so discard it
-      s->rhs(s->petsc_mf_t, s->petsc_mf_y.data(), s->petsc_mf_fv.data(), true);
     } catch (BoutRhsFail&) {
       failed = 1;
     }
