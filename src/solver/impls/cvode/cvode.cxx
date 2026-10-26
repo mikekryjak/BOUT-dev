@@ -1703,7 +1703,8 @@ void CvodeSolver::petscCheckSetup(BoutReal t, BoutReal gamma, bool fresh,
         const BoutReal ratio_2 = df2 > 0.0 ? std::sqrt(total[k] / df2) : -1.0;
         const BoutReal dfmax = global_largest[nfields + k].value;
         const BoutReal ratio_max = dfmax > 0.0 ? global_largest[k].value / dfmax : -1.0;
-        // The size of gamma Jf v against v: how much Jf weighs in the operator
+        // The size of gamma df = gamma (f(y + v) - f(y)) against v: how much the
+        // rhs's own Jacobian weighs in CVODE's operator I - gamma J
         const BoutReal v2 = total[2 * nfields + k];
         const BoutReal gamma_jf = v2 > 0.0 ? gamma * std::sqrt(df2 / v2) : -1.0;
         std::fputs(fmt::format("petsc_check jacobian t={:.6e} gamma={:.6e} v={:s} "
