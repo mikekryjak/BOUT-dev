@@ -118,6 +118,13 @@ private:
   /// Set ``petsc_shell_mask``: 1 on the rows of the comma-separated evolved
   /// ``fields``, 0 on all others, ``nlocal`` rows in the solver's order.
   void makeShellMask(const std::string& fields, int nlocal);
+  /// Set ``petsc_check_field``, the evolved field of each of the ``nlocal``
+  /// rows, and ``petsc_check_names``, the fields' names.
+  void makeCheckFieldMap(int nlocal);
+  /// solver:cvode_petsc_check: print a trace of this setup to stderr; after a
+  /// ``fresh`` Jacobian, also compare it with differences of the rhs at ``y``.
+  void petscCheckSetup(BoutReal t, BoutReal gamma, bool fresh, const BoutReal* y,
+                       Mat jacobian);
   /// Write one Jacobian matrix and the shared metadata JSON.
   void exportMatrixAndMetadata(bout::JacobianExportKind kind, Mat jacobian);
   /// Build and save a diagnostic Jacobian of the requested kind.
@@ -190,6 +197,9 @@ private:
       jacobian_export_trigger; ///< Export on ``output`` or ``linear_setup``
   /// Save the right-hand side of the first N linear solves to ``datadir``
   int save_linear_rhs;
+  /// Trace each PETSc preconditioner setup and check each coloured Jacobian,
+  /// on stderr
+  bool petsc_check;
 
   // Diagnostics from CVODE
   int nsteps{0};
@@ -243,6 +253,11 @@ private:
   BoutReal* petsc_shell_y{nullptr};
   /// The shell's output is multiplied by this; empty means all rows kept
   std::vector<BoutReal> petsc_shell_mask;
+  /// For solver:cvode_petsc_check: each local row's field, the fields' names,
+  /// and the failed preconditioner solves printed so far
+  std::vector<int> petsc_check_field;
+  std::vector<std::string> petsc_check_names;
+  int petsc_check_failures{0};
 #endif
 };
 

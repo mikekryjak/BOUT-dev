@@ -67,9 +67,12 @@
 #include <sunlinsol/sunlinsol_sptfqmr.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <iterator>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -260,6 +263,11 @@ CvodeSolver::CvodeSolver(Options* opts)
                                "of the first N GMRES solves to datadir, one "
                                "linear_rhs.<rank>.bin per processor. 0 saves none.")
                           .withDefault(0)),
+      petsc_check((*options)["cvode_petsc_check"]
+                      .doc("With cvode_precon_method=petsc, print each "
+                           "preconditioner setup to stderr, and compare each "
+                           "coloured Jacobian with differences of the rhs")
+                      .withDefault(false)),
       suncontext(createSUNContext(BoutComm::get())) {
   supports_constraints = false; // This solver doesn't have constraints
   canReset = true;
@@ -762,6 +770,11 @@ int CvodeSolver::init() {
         }
       }
 
+      if (petsc_check) {
+        makeCheckFieldMap(local_N);
+        output_info.write("\tPETSc preconditioner setups traced on stderr\n");
+      }
+
       if (petsc_x == nullptr) {
         PetscCall(VecCreateMPI(BoutComm::get(), local_N, petsc_global_N, &petsc_x));
         PetscCall(VecDuplicate(petsc_x, &petsc_f));
@@ -949,6 +962,15 @@ int CvodeSolver::run() {
                    num_fails, nonlin_fails);
 
       output.write("    -> Stability limit order reductions: {:d}\n", stab_lims);
+
+#if SUNDIALS_VERSION_AT_LEAST(6, 2, 0)
+      if (petsc_check) {
+        // Nonlinear convergence failures count every failed Newton solve,
+        // retries after a fresh setup included; this counts the failed steps
+        CVodeGetNumStepSolveFails(cvode_mem, &temp_long_int);
+        output.write("    -> Failed steps (nonlinear solve): {:d}\n", temp_long_int);
+      }
+#endif
     }
 
     /// Call the monitor function
@@ -1274,6 +1296,9 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
     if (ierr != 0) {
       return 1;
     }
+    if (s->petsc_check) {
+      s->petscCheckSetup(t, gamma, false, nullptr, J);
+    }
     if (jcurPtr != nullptr) {
       *jcurPtr = 0;
     }
@@ -1344,6 +1369,10 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
     return 1;
   }
 
+  if (s->petsc_check) {
+    s->petscCheckSetup(t, gamma, true, ydata, J);
+  }
+
   if (jcurPtr != nullptr) {
     *jcurPtr = 1;
   }
@@ -1378,6 +1407,23 @@ int CvodeSolver::petscPSolve(BoutReal t, N_Vector yy, N_Vector UNUSED(yp), N_Vec
   KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
   if (ierr == 0) {
     ierr = KSPGetConvergedReason(s->petsc_ksp, &reason);
+  }
+
+  if (s->petsc_check and ierr == 0 and s->petsc_check_failures < 100) {
+    PC pc = nullptr;
+    PCFailedReason pc_reason = PC_NOERROR;
+    if (KSPGetPC(s->petsc_ksp, &pc) == 0) {
+      PCGetFailedReason(pc, &pc_reason);
+    }
+    if (reason < 0 or pc_reason != PC_NOERROR) {
+      s->petsc_check_failures++;
+      std::fputs(fmt::format("petsc_check solve_failed rank={:d} t={:.6e} gamma={:.6e} "
+                             "ksp={:s} pc={:s}\n",
+                             BoutComm::rank(), t, gamma, KSPConvergedReasons[reason],
+                             PCFailedReasons[pc_reason])
+                     .c_str(),
+                 stderr);
+    }
   }
 
   VecResetArray(s->petsc_r);
@@ -1477,6 +1523,203 @@ void CvodeSolver::makeShellMask(const std::string& fields, int nlocal) {
 
   petsc_shell_mask.resize(nlocal);
   save_derivs(petsc_shell_mask.data());
+}
+
+void CvodeSolver::makeCheckFieldMap(int nlocal) {
+  // Each field's number in its time derivative; as in makeShellMask, the rhs
+  // overwrites these before they are next used
+  petsc_check_names.clear();
+  for (const auto& f : f2d) {
+    *f.F_var = static_cast<BoutReal>(petsc_check_names.size());
+    petsc_check_names.push_back(f.name);
+  }
+  for (const auto& f : f3d) {
+    *f.F_var = static_cast<BoutReal>(petsc_check_names.size());
+    petsc_check_names.push_back(f.name);
+  }
+
+  std::vector<BoutReal> field(nlocal);
+  save_derivs(field.data());
+  petsc_check_field.resize(nlocal);
+  std::transform(field.begin(), field.end(), petsc_check_field.begin(),
+                 [](BoutReal k) { return static_cast<int>(k); });
+}
+
+void CvodeSolver::petscCheckSetup(BoutReal t, BoutReal gamma, bool fresh,
+                                  const BoutReal* y, Mat jacobian) {
+  const bool root = BoutComm::rank() == 0;
+
+  long int steps = 0;
+  long int newton_fails = 0;
+  long int step_fails = 0;
+  long int error_fails = 0;
+  long int liters = 0;
+  sunrealtype h = 0.0;
+  CVodeGetNumSteps(cvode_mem, &steps);
+  CVodeGetCurrentStep(cvode_mem, &h);
+  CVodeGetNumNonlinSolvConvFails(cvode_mem, &newton_fails);
+#if SUNDIALS_VERSION_AT_LEAST(6, 2, 0)
+  CVodeGetNumStepSolveFails(cvode_mem, &step_fails);
+#endif
+  CVodeGetNumErrTestFails(cvode_mem, &error_fails);
+  CVodeGetNumLinIters(cvode_mem, &liters);
+
+  if (root) {
+    std::fputs(fmt::format("petsc_check setup t={:.6e} gamma={:.6e} {:s} steps={:d} "
+                           "h={:.6e} newton_fails={:d} step_fails={:d} "
+                           "error_fails={:d} liters={:d}\n",
+                           t, gamma, fresh ? "fresh" : "rescaled", steps, h,
+                           newton_fails, step_fails, error_fails, liters)
+                   .c_str(),
+               stderr);
+  }
+
+  if (not fresh) {
+    return;
+  }
+
+  // The coloured matrix M is I - gamma Jf. Compare its Jf v = (v - M v) / gamma
+  // with the rhs difference f(y + v) - f(y), in CVODE's weighted norm, for v of
+  // weighted RMS size 1, as CVODE's own difference quotient takes. Comparing Jf
+  // rather than M keeps the identity from hiding an error in Jf at small gamma.
+  const auto n = static_cast<int>(petsc_check_field.size());
+  const auto nfields = static_cast<int>(petsc_check_names.size());
+
+  N_Vector weights = N_VClone(uvec);
+  CVodeGetErrWeights(cvode_mem, weights);
+  const BoutReal* w = N_VGetArrayPointer(weights);
+
+  PetscInt row0 = 0;
+  VecGetOwnershipRange(petsc_x, &row0, nullptr);
+
+  // A failed rhs on any processor skips the comparison on all of them
+  auto evaluate = [this, t](BoutReal* u, BoutReal* du) {
+    int failed = 0;
+    try {
+      rhs(t, u, du, true);
+    } catch (BoutRhsFail&) {
+      failed = 1;
+    }
+    int any_failed = 0;
+    bout::globals::mpi->MPI_Allreduce(&failed, &any_failed, 1, MPI_INT, MPI_MAX,
+                                      BoutComm::get());
+    return any_failed == 0;
+  };
+
+  std::vector<BoutReal> y0(y, y + n);
+  std::vector<BoutReal> f0(n);
+  std::vector<BoutReal> f1(n);
+  std::vector<BoutReal> yv(n);
+  std::vector<BoutReal> mv(n);
+
+  if (not evaluate(y0.data(), f0.data())) {
+    if (root) {
+      std::fputs("petsc_check jacobian skipped: rhs failed at y\n", stderr);
+    }
+    N_VDestroy(weights);
+    return;
+  }
+
+  // v_i = +-1 / w_i, with fixed pseudo-random signs, so every run checks the same v
+  std::mt19937 generator(12345U + static_cast<unsigned>(BoutComm::rank()));
+  std::vector<BoutReal> random_v(n);
+  for (int i = 0; i < n; ++i) {
+    random_v[i] = (((generator() & 1U) != 0U) ? 1.0 : -1.0) / w[i];
+  }
+
+  // A smooth v: f(y), scaled to weighted RMS size 1
+  BoutReal local_sum = 0.0;
+  for (int i = 0; i < n; ++i) {
+    local_sum += SQ(w[i] * f0[i]);
+  }
+  BoutReal sum = 0.0;
+  bout::globals::mpi->MPI_Allreduce(&local_sum, &sum, 1, MPI_DOUBLE, MPI_SUM,
+                                    BoutComm::get());
+  const BoutReal scale =
+      sum > 0.0 ? 1.0 / std::sqrt(sum / static_cast<BoutReal>(petsc_global_N)) : 0.0;
+  std::vector<BoutReal> rhs_v(n);
+  for (int i = 0; i < n; ++i) {
+    rhs_v[i] = scale * f0[i];
+  }
+
+  const std::array<const char*, 2> labels{"random", "rhs"};
+  const std::array<const std::vector<BoutReal>*, 2> vectors{&random_v, &rhs_v};
+  for (std::size_t c = 0; c < labels.size(); ++c) {
+    const auto& v = *vectors[c];
+    for (int i = 0; i < n; ++i) {
+      yv[i] = y0[i] + v[i];
+    }
+    if (not evaluate(yv.data(), f1.data())) {
+      if (root) {
+        std::fputs(fmt::format("petsc_check jacobian v={:s} skipped: rhs failed\n",
+                               labels[c])
+                       .c_str(),
+                   stderr);
+      }
+      continue;
+    }
+
+    VecPlaceArray(petsc_r, v.data());
+    VecPlaceArray(petsc_z, mv.data());
+    MatMult(jacobian, petsc_r, petsc_z);
+    VecResetArray(petsc_r);
+    VecResetArray(petsc_z);
+
+    // Per field: sums of squares of W (Jf v - df), W df and W v; the largest
+    // |W (Jf v - df)| and |W df|, each with its global row
+    std::vector<BoutReal> sums(3 * nfields, 0.0);
+    struct ValueRow {
+      double value;
+      int row;
+    };
+    std::vector<ValueRow> largest(2 * nfields, ValueRow{0.0, -1});
+    for (int i = 0; i < n; ++i) {
+      const int k = petsc_check_field[i];
+      const BoutReal df = w[i] * (f1[i] - f0[i]);
+      const BoutReal err = w[i] * (v[i] - mv[i]) / gamma - df;
+      sums[k] += SQ(err);
+      sums[nfields + k] += SQ(df);
+      sums[2 * nfields + k] += SQ(w[i] * v[i]);
+      const int row = static_cast<int>(row0) + i;
+      if (std::abs(err) > largest[k].value) {
+        largest[k] = ValueRow{std::abs(err), row};
+      }
+      if (std::abs(df) > largest[nfields + k].value) {
+        largest[nfields + k] = ValueRow{std::abs(df), row};
+      }
+    }
+    std::vector<BoutReal> total(sums.size());
+    bout::globals::mpi->MPI_Allreduce(sums.data(), total.data(),
+                                      static_cast<int>(sums.size()), MPI_DOUBLE,
+                                      MPI_SUM, BoutComm::get());
+    std::vector<ValueRow> global_largest(largest.size());
+    bout::globals::mpi->MPI_Allreduce(largest.data(), global_largest.data(),
+                                      static_cast<int>(largest.size()),
+                                      MPI_DOUBLE_INT, MPI_MAXLOC, BoutComm::get());
+
+    if (root) {
+      for (int k = 0; k < nfields; ++k) {
+        const BoutReal df2 = total[nfields + k];
+        const BoutReal ratio_2 = df2 > 0.0 ? std::sqrt(total[k] / df2) : -1.0;
+        const BoutReal dfmax = global_largest[nfields + k].value;
+        const BoutReal ratio_max = dfmax > 0.0 ? global_largest[k].value / dfmax : -1.0;
+        // The size of gamma Jf v against v: how much Jf weighs in the operator
+        const BoutReal v2 = total[2 * nfields + k];
+        const BoutReal gamma_jf = v2 > 0.0 ? gamma * std::sqrt(df2 / v2) : -1.0;
+        std::fputs(fmt::format("petsc_check jacobian t={:.6e} gamma={:.6e} v={:s} "
+                               "field={:s} ratio_2={:.3e} ratio_max={:.3e} "
+                               "worst_row={:d} gamma_jf={:.3e}\n",
+                               t, gamma, labels[c], petsc_check_names[k], ratio_2,
+                               ratio_max, global_largest[k].row, gamma_jf)
+                       .c_str(),
+                   stderr);
+      }
+    }
+  }
+
+  // Leave Hermes-3's stored state at y, not at y + v
+  evaluate(y0.data(), f1.data());
+  N_VDestroy(weights);
 }
 #endif
 
