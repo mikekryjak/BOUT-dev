@@ -327,6 +327,9 @@ CvodeSolver::~CvodeSolver() {
     if (petsc_mf_matrix != nullptr) {
       MatDestroy(&petsc_mf_matrix);
     }
+    if (petsc_jac_block != nullptr) {
+      MatDestroy(&petsc_jac_block);
+    }
     if (petsc_mf_weights != nullptr) {
       N_VDestroy(petsc_mf_weights);
     }
@@ -793,6 +796,33 @@ int CvodeSolver::init() {
           PetscCall(PCSetUseAmat(pc, PETSC_TRUE));
           output_info.write("\tPETSc preconditioner's Amat is CVODE's matrix-free "
                             "operator\n");
+        }
+
+        // Preconditioners built from the coloured matrix, such as block
+        // Jacobi, can be kept to some fields: they are built from a copy whose
+        // other rows and columns hold only a large diagonal, so they return
+        // almost zero there. A composite's leftover then needs the unmasked
+        // operator, its Amat.
+        const auto block_fields =
+            (*options)["cvode_petsc_block_fields"]
+                .doc("Comma-separated evolved fields to which the preconditioners "
+                     "built from the coloured matrix are kept; they return almost "
+                     "zero on all others. Empty: all fields.")
+                .withDefault<std::string>("");
+        if (!block_fields.empty()) {
+          const auto mask =
+              makeFieldMask(block_fields, local_N, "cvode_petsc_block_fields");
+          petsc_block_rows_out.clear();
+          for (int i = 0; i < local_N; ++i) {
+            if (mask[i] == 0.0) {
+              petsc_block_rows_out.push_back(i);
+            }
+          }
+          petsc_block_mask = true;
+          PetscCall(PCSetUseAmat(pc, PETSC_TRUE));
+          output_info.write("\tPreconditioners from the coloured matrix kept to "
+                            "fields: {:s}\n",
+                            block_fields);
         }
       }
 
@@ -1314,8 +1344,7 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
       ierr = MatShift(J, 1.0 - ratio);
     }
     if (ierr == 0) {
-      ierr = KSPSetOperators(s->petsc_ksp, s->petsc_mf_residual ? s->petsc_mf_matrix : J,
-                             J);
+      ierr = s->petscSetOperators(J);
     }
     if (ierr == 0) {
       ierr = KSPSetUp(s->petsc_ksp);
@@ -1385,7 +1414,7 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
   }
   s->petsc_jac_gamma = gamma;
 
-  ierr = KSPSetOperators(s->petsc_ksp, s->petsc_mf_residual ? s->petsc_mf_matrix : J, J);
+  ierr = s->petscSetOperators(J);
   if (ierr == 0) {
     ierr = KSPSetUp(s->petsc_ksp);
   }
@@ -1584,6 +1613,35 @@ PetscErrorCode CvodeSolver::attachUserShells(PC pc, int& nshells) {
 }
 
 void CvodeSolver::makeShellMask(const std::string& fields, int nlocal) {
+  petsc_shell_mask = makeFieldMask(fields, nlocal, "cvode_petsc_shell_fields");
+}
+
+PetscErrorCode CvodeSolver::petscSetOperators(Mat J) {
+  Mat pmat = J;
+  if (petsc_block_mask) {
+    if (petsc_jac_block == nullptr) {
+      PetscCall(MatDuplicate(J, MAT_COPY_VALUES, &petsc_jac_block));
+      PetscCall(MatSetOption(petsc_jac_block, MAT_KEEP_NONZERO_PATTERN, PETSC_TRUE));
+    } else {
+      PetscCall(MatCopy(J, petsc_jac_block, SAME_NONZERO_PATTERN));
+    }
+    PetscInt istart = 0;
+    PetscCall(MatGetOwnershipRange(J, &istart, nullptr));
+    std::vector<PetscInt> rows(petsc_block_rows_out);
+    for (auto& row : rows) {
+      row += istart;
+    }
+    // A block solve returns its input over 1e20 on these rows
+    PetscCall(MatZeroRowsColumns(petsc_jac_block, static_cast<PetscInt>(rows.size()),
+                                 rows.data(), 1e20, nullptr, nullptr));
+    pmat = petsc_jac_block;
+  }
+  PetscCall(KSPSetOperators(petsc_ksp, petsc_mf_residual ? petsc_mf_matrix : J, pmat));
+  return PETSC_SUCCESS;
+}
+
+std::vector<BoutReal> CvodeSolver::makeFieldMask(const std::string& fields, int nlocal,
+                                                 const std::string& option) {
   std::set<std::string> names;
   for (const auto& name : strsplit(fields, ',')) {
     names.insert(trim(name));
@@ -1608,14 +1666,14 @@ void CvodeSolver::makeShellMask(const std::string& fields, int nlocal) {
   }
   for (const auto& name : names) {
     if (found.count(name) == 0) {
-      throw BoutException("solver:cvode_petsc_shell_fields names '{:s}', which is not "
-                          "an evolved field",
-                          name);
+      throw BoutException("solver:{:s} names '{:s}', which is not an evolved field",
+                          option, name);
     }
   }
 
-  petsc_shell_mask.resize(nlocal);
-  save_derivs(petsc_shell_mask.data());
+  std::vector<BoutReal> mask(nlocal);
+  save_derivs(mask.data());
+  return mask;
 }
 
 void CvodeSolver::makeCheckFieldMap(int nlocal) {

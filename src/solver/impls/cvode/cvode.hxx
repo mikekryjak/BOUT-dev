@@ -124,6 +124,16 @@ private:
   /// Set ``petsc_shell_mask``: 1 on the rows of the comma-separated evolved
   /// ``fields``, 0 on all others, ``nlocal`` rows in the solver's order.
   void makeShellMask(const std::string& fields, int nlocal);
+  /// 1 on the rows of the comma-separated evolved ``fields``, 0 on all others,
+  /// ``nlocal`` rows in the solver's order; ``option`` names the input option
+  /// in the error for a field that is not evolved.
+  std::vector<BoutReal> makeFieldMask(const std::string& fields, int nlocal,
+                                      const std::string& option);
+  /// Give ``petsc_ksp`` its operators after a setup that left ``J``: the
+  /// matrix-free product or ``J`` as Amat, and as Pmat ``J``, or with
+  /// solver:cvode_petsc_block_fields its copy ``petsc_jac_block``, whose rows
+  /// and columns outside those fields hold only a large diagonal.
+  PetscErrorCode petscSetOperators(Mat J);
   /// Set ``petsc_check_field``, the evolved field of each of the ``nlocal``
   /// rows, and ``petsc_check_names``, the fields' names.
   void makeCheckFieldMap(int nlocal);
@@ -259,6 +269,12 @@ private:
   BoutReal* petsc_shell_y{nullptr};
   /// The shell's output is multiplied by this; empty means all rows kept
   std::vector<BoutReal> petsc_shell_mask;
+  /// solver:cvode_petsc_block_fields: the local rows outside those fields,
+  /// and the copy of the coloured matrix the preconditioners are built from;
+  /// unused while ``petsc_block_mask`` is false
+  std::vector<PetscInt> petsc_block_rows_out;
+  bool petsc_block_mask{false};
+  Mat petsc_jac_block{nullptr};
   /// For solver:cvode_petsc_check: each local row's field, the fields' names,
   /// and the failed preconditioner solves printed so far
   std::vector<int> petsc_check_field;

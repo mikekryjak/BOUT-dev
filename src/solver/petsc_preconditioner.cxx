@@ -166,6 +166,17 @@ PetscErrorCode PetscPreconditioner::createJacobianPattern(Field3D& index,
     throw BoutException("stencil:yline = {:d} reaches past the {:d} guard cells along y",
                         n_yline, mesh->ystart);
   }
+  auto yline_xperiod =
+      options["stencil:yline_xperiod"]
+          .doc("With stencil:yline, also colour by global x index modulo this. 1: "
+               "couplings along x add into the column at the same x; n > reach along "
+               "x: they drop out, so each line holds only its own entries")
+          .withDefault<int>(1);
+  if (yline_xperiod < 1 || (yline_xperiod > 1 && n_yline == 0)) {
+    throw BoutException("stencil:yline_xperiod = {:d} needs stencil:yline and a value "
+                        "of at least 1",
+                        yline_xperiod);
+  }
 
   const auto xy_offsets = (n_yline > 0)
                               ? ColoringStencil::getYOffsets(n_yline)
@@ -358,6 +369,9 @@ PetscErrorCode PetscPreconditioner::createJacobianPattern(Field3D& index,
     // One colour per variable and position along y, the same at every x and z.
     // Perturbing one colour then reaches each row through one column of its
     // pattern, so that column takes the row's couplings along x and z as well.
+    // With yline_xperiod > 1 the colour also takes the position along x: a
+    // coupling to another x then has a colour the row's pattern lacks, and
+    // drops out, unless it reaches yline_xperiod cells or more.
     const int period = (2 * n_yline) + 1;
     const int nvars = n2d + n3d;
 
@@ -393,7 +407,10 @@ PetscErrorCode PetscPreconditioner::createJacobianPattern(Field3D& index,
     line_colors.assign(nlocal, 0);
     for (int x = mesh->xstart; x <= mesh->xend; x++) {
       for (int y = mesh->ystart; y <= mesh->yend; y++) {
-        const int offset = nvars * ((y - mesh->ystart) % period);
+        const int offset =
+            nvars
+            * (((y - mesh->ystart) % period)
+               + (period * (mesh->getGlobalXIndex(x) % yline_xperiod)));
         const int ind0 = ROUND(index(x, y, 0)) - Istart;
         for (int i = 0; i < n2d; i++) {
           line_colors[ind0 + i] = static_cast<ISColoringValue>(offset + i);
@@ -407,8 +424,12 @@ PetscErrorCode PetscPreconditioner::createJacobianPattern(Field3D& index,
         }
       }
     }
-    n_line_colors = nvars * period;
+    n_line_colors = nvars * period * yline_xperiod;
     output_info.write("\tJacobian coloured along y only: {:d} colours\n", n_line_colors);
+    if (yline_xperiod > 1) {
+      output_info.write("\tCouplings along x within {:d} cells drop out of the lines\n",
+                        yline_xperiod - 1);
+    }
   }
 
   output_progress.write("Assembling Jacobian matrix\n");
