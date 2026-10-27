@@ -268,6 +268,10 @@ CvodeSolver::CvodeSolver(Options* opts)
                            "preconditioner setup to stderr, and compare each "
                            "coloured Jacobian with differences of the rhs")
                       .withDefault(false)),
+      petsc_check_scale((*options)["cvode_petsc_check_scale"]
+                            .doc("With cvode_petsc_check, scale the check's vectors "
+                                 "v by this factor; 1 takes CVODE's weighted size 1")
+                            .withDefault(1.0)),
       petsc_dense_probe(
           (*options)["cvode_petsc_dense_probe"]
               .doc("With cvode_precon_method=petsc, at the first fresh coloured "
@@ -1788,7 +1792,8 @@ void CvodeSolver::petscCheckSetup(BoutReal t, BoutReal gamma, bool fresh,
   std::mt19937 generator(12345U + static_cast<unsigned>(BoutComm::rank()));
   std::vector<BoutReal> random_v(n);
   for (int i = 0; i < n; ++i) {
-    random_v[i] = (((generator() & 1U) != 0U) ? 1.0 : -1.0) / w[i];
+    random_v[i] = (((generator() & 1U) != 0U) ? petsc_check_scale : -petsc_check_scale)
+                  / w[i];
   }
 
   // A smooth v: f(y), scaled to weighted RMS size 1
@@ -1800,7 +1805,9 @@ void CvodeSolver::petscCheckSetup(BoutReal t, BoutReal gamma, bool fresh,
   bout::globals::mpi->MPI_Allreduce(&local_sum, &sum, 1, MPI_DOUBLE, MPI_SUM,
                                     BoutComm::get());
   const BoutReal scale =
-      sum > 0.0 ? 1.0 / std::sqrt(sum / static_cast<BoutReal>(petsc_global_N)) : 0.0;
+      sum > 0.0
+          ? petsc_check_scale / std::sqrt(sum / static_cast<BoutReal>(petsc_global_N))
+          : 0.0;
   std::vector<BoutReal> rhs_v(n);
   for (int i = 0; i < n; ++i) {
     rhs_v[i] = scale * f0[i];

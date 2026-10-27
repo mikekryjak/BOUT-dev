@@ -222,6 +222,8 @@ private:
   /// Trace each PETSc preconditioner setup and check each coloured Jacobian,
   /// on stderr
   bool petsc_check;
+  /// Factor on the check's vectors v; 1 is CVODE's weighted size 1
+  BoutReal petsc_check_scale;
   /// At the first fresh coloured Jacobian, difference every column alone and
   /// save the responses outside the colouring's pattern; see petscDenseProbe
   bool petsc_dense_probe;
