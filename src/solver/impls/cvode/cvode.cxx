@@ -268,6 +268,12 @@ CvodeSolver::CvodeSolver(Options* opts)
                            "preconditioner setup to stderr, and compare each "
                            "coloured Jacobian with differences of the rhs")
                       .withDefault(false)),
+      petsc_dense_probe(
+          (*options)["cvode_petsc_dense_probe"]
+              .doc("With cvode_precon_method=petsc, at the first fresh coloured "
+                   "Jacobian, difference every column alone and save the responses "
+                   "outside the colouring's pattern to dense_probe.<rank>.csv")
+              .withDefault(false)),
       suncontext(createSUNContext(BoutComm::get())) {
   supports_constraints = false; // This solver doesn't have constraints
   canReset = true;
@@ -826,8 +832,10 @@ int CvodeSolver::init() {
         }
       }
 
-      if (petsc_check) {
+      if (petsc_check or petsc_dense_probe) {
         makeCheckFieldMap(local_N);
+      }
+      if (petsc_check) {
         output_info.write("\tPETSc preconditioner setups traced on stderr\n");
       }
 
@@ -1429,6 +1437,11 @@ int CvodeSolver::petscPSetup(BoutReal t, N_Vector yy, N_Vector UNUSED(yp),
     s->petscCheckSetup(t, gamma, true, ydata, J);
   }
 
+  if (s->petsc_dense_probe and not s->petsc_dense_probe_done) {
+    s->petsc_dense_probe_done = true;
+    s->petscDenseProbe(t, ydata, J);
+  }
+
   if (jcurPtr != nullptr) {
     *jcurPtr = 1;
   }
@@ -1872,6 +1885,193 @@ void CvodeSolver::petscCheckSetup(BoutReal t, BoutReal gamma, bool fresh,
   // Leave Hermes-3's stored state at y, not at y + v
   evaluate(y0.data(), f1.data());
   N_VDestroy(weights);
+}
+
+void CvodeSolver::petscDenseProbe(BoutReal t, const BoutReal* y, Mat jacobian) {
+  const bool root = BoutComm::rank() == 0;
+  const int nprocs = BoutComm::size();
+  const auto n = static_cast<int>(petsc_check_field.size());
+  const auto nfields = static_cast<int>(petsc_check_names.size());
+
+  // A failed rhs on any processor fails it on all of them
+  auto evaluate = [this, t](BoutReal* u, BoutReal* du) {
+    int failed = 0;
+    try {
+      rhs(t, u, du, true);
+    } catch (BoutRhsFail&) {
+      failed = 1;
+    }
+    int any_failed = 0;
+    bout::globals::mpi->MPI_Allreduce(&failed, &any_failed, 1, MPI_INT, MPI_MAX,
+                                      BoutComm::get());
+    return any_failed == 0;
+  };
+  auto sum_all = [](std::vector<BoutReal>& v) {
+    std::vector<BoutReal> total(v.size());
+    bout::globals::mpi->MPI_Allreduce(v.data(), total.data(), static_cast<int>(v.size()),
+                                      MPI_DOUBLE, MPI_SUM, BoutComm::get());
+    v = total;
+  };
+  auto max_all = [](std::vector<BoutReal>& v) {
+    std::vector<BoutReal> total(v.size());
+    bout::globals::mpi->MPI_Allreduce(v.data(), total.data(), static_cast<int>(v.size()),
+                                      MPI_DOUBLE, MPI_MAX, BoutComm::get());
+    v = total;
+  };
+
+  PetscInt row0 = 0;
+  VecGetOwnershipRange(petsc_x, &row0, nullptr);
+  // Each processor's first global row, to find the owner of a column
+  std::vector<BoutReal> starts(nprocs + 1, 0.0);
+  starts[BoutComm::rank()] = static_cast<BoutReal>(row0);
+  sum_all(starts);
+  starts[nprocs] = static_cast<BoutReal>(petsc_global_N);
+
+  // PETSc's ds step (MatFDColoringApply): err * max(|u|, umin), with u's sign
+  PetscReal err = PETSC_SQRT_MACHINE_EPSILON;
+  PetscReal umin = 100.0 * PETSC_SQRT_MACHINE_EPSILON;
+  PetscOptionsGetReal(nullptr, nullptr, "-mat_fd_coloring_err", &err, nullptr);
+  PetscOptionsGetReal(nullptr, nullptr, "-mat_fd_coloring_umin", &umin, nullptr);
+
+  // Each local row's pattern in the coloured matrix, sorted
+  std::vector<std::vector<PetscInt>> pattern(n);
+  for (int i = 0; i < n; ++i) {
+    PetscInt ncols = 0;
+    const PetscInt* cols = nullptr;
+    MatGetRow(jacobian, row0 + i, &ncols, &cols, nullptr);
+    pattern[i].assign(cols, cols + ncols);
+    MatRestoreRow(jacobian, row0 + i, &ncols, &cols, nullptr);
+    std::sort(pattern[i].begin(), pattern[i].end());
+  }
+
+  std::vector<BoutReal> y0(y, y + n);
+  std::vector<BoutReal> f0(n);
+  std::vector<BoutReal> f1(n);
+  if (not evaluate(y0.data(), f0.data()) or not evaluate(y0.data(), f1.data())) {
+    if (root) {
+      std::fputs("dense_probe skipped: rhs failed at y\n", stderr);
+    }
+    return;
+  }
+
+  // Per field: the largest |f1 - f0| and the largest |f0|
+  auto print_repeat = [&](const char* label) {
+    std::vector<BoutReal> largest(2 * nfields, 0.0);
+    for (int i = 0; i < n; ++i) {
+      const int k = petsc_check_field[i];
+      largest[k] = std::max(largest[k], std::abs(f1[i] - f0[i]));
+      largest[nfields + k] = std::max(largest[nfields + k], std::abs(f0[i]));
+    }
+    max_all(largest);
+    if (root) {
+      for (int k = 0; k < nfields; ++k) {
+        std::fputs(fmt::format("dense_probe repeat={:s} field={:s} max_diff={:.3e} "
+                               "max_rhs={:.3e}\n",
+                               label, petsc_check_names[k], largest[k],
+                               largest[nfields + k])
+                       .c_str(),
+                   stderr);
+      }
+    }
+  };
+  print_repeat("before");
+
+  struct Response {
+    PetscInt row;
+    PetscInt col;
+    BoutReal value;
+  };
+  std::vector<Response> outside;
+  constexpr std::size_t max_records = 200000;
+  long dropped = 0;
+  int failed_columns = 0;
+  std::vector<BoutReal> row_max(n, 0.0);
+  std::vector<BoutReal> yc(y0);
+  int owner = 0;
+  for (PetscInt c = 0; c < petsc_global_N; ++c) {
+    while (static_cast<BoutReal>(c) >= starts[owner + 1]) {
+      ++owner;
+    }
+    std::vector<BoutReal> step(1, 0.0);
+    if (owner == BoutComm::rank()) {
+      const auto i = static_cast<int>(c - row0);
+      const BoutReal mag = std::max(std::abs(y0[i]), static_cast<BoutReal>(umin));
+      step[0] = err * (y0[i] >= 0.0 ? mag : -mag);
+      yc[i] = y0[i] + step[0];
+    }
+    sum_all(step);
+    if (evaluate(yc.data(), f1.data())) {
+      for (int i = 0; i < n; ++i) {
+        const BoutReal d = (f1[i] - f0[i]) / step[0];
+        if (d == 0.0) {
+          continue;
+        }
+        row_max[i] = std::max(row_max[i], std::abs(d));
+        if (not std::binary_search(pattern[i].begin(), pattern[i].end(), c)) {
+          if (outside.size() < max_records) {
+            outside.push_back(Response{row0 + i, c, d});
+          } else {
+            ++dropped;
+          }
+        }
+      }
+    } else {
+      ++failed_columns;
+    }
+    if (owner == BoutComm::rank()) {
+      yc[c - row0] = y0[c - row0];
+    }
+  }
+
+  const std::string datadir = Options::root()["datadir"];
+  const auto filename = fmt::format("{}/dense_probe.{}.csv", datadir, BoutComm::rank());
+  std::FILE* file = std::fopen(filename.c_str(), "w");
+  if (file == nullptr) {
+    throw BoutException("solver:cvode_petsc_dense_probe could not open {}", filename);
+  }
+  std::fputs("row,col,value,row_max\n", file);
+  // Per field of the row: responses outside the pattern above 1e-8 of the
+  // row's largest response, and the largest such ratio
+  std::vector<BoutReal> counts(nfields, 0.0);
+  std::vector<BoutReal> worst(nfields, 0.0);
+  for (const auto& r : outside) {
+    const auto i = static_cast<int>(r.row - row0);
+    std::fputs(fmt::format("{:d},{:d},{:.9e},{:.9e}\n", r.row, r.col, r.value, row_max[i])
+                   .c_str(),
+               file);
+    const BoutReal ratio = std::abs(r.value) / row_max[i];
+    if (ratio > 1e-8) {
+      const int k = petsc_check_field[i];
+      counts[k] += 1.0;
+      worst[k] = std::max(worst[k], ratio);
+    }
+  }
+  std::fclose(file);
+  sum_all(counts);
+  max_all(worst);
+  std::vector<BoutReal> lost{static_cast<BoutReal>(dropped),
+                             static_cast<BoutReal>(failed_columns)};
+  sum_all(lost);
+  if (root) {
+    for (int k = 0; k < nfields; ++k) {
+      std::fputs(fmt::format("dense_probe outside field={:s} entries={:.0f} "
+                             "worst_ratio={:.3e}\n",
+                             petsc_check_names[k], counts[k], worst[k])
+                     .c_str(),
+                 stderr);
+    }
+    std::fputs(fmt::format("dense_probe columns={:d} err={:.3e} umin={:.3e} "
+                           "dropped={:.0f} failed_columns={:.0f}\n",
+                           petsc_global_N, err, umin, lost[0], lost[1] / nprocs)
+                   .c_str(),
+               stderr);
+  }
+
+  // Once more at y, after every perturbed call; this also leaves Hermes-3's
+  // stored state at y
+  if (evaluate(y0.data(), f1.data())) {
+    print_repeat("after");
+  }
 }
 #endif
 

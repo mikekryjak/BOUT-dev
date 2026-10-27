@@ -141,6 +141,12 @@ private:
   /// ``fresh`` Jacobian, also compare it with differences of the rhs at ``y``.
   void petscCheckSetup(BoutReal t, BoutReal gamma, bool fresh, const BoutReal* y,
                        Mat jacobian);
+  /// solver:cvode_petsc_dense_probe: evaluate the rhs at ``y`` twice, then
+  /// difference each global column alone at PETSc's ds step, write each
+  /// response outside ``jacobian``'s pattern to dense_probe.<rank>.csv in
+  /// datadir, and evaluate the rhs at ``y`` once more; print the summary
+  /// and both repeat differences to stderr.
+  void petscDenseProbe(BoutReal t, const BoutReal* y, Mat jacobian);
   /// Write one Jacobian matrix and the shared metadata JSON.
   void exportMatrixAndMetadata(bout::JacobianExportKind kind, Mat jacobian);
   /// Build and save a diagnostic Jacobian of the requested kind.
@@ -216,6 +222,10 @@ private:
   /// Trace each PETSc preconditioner setup and check each coloured Jacobian,
   /// on stderr
   bool petsc_check;
+  /// At the first fresh coloured Jacobian, difference every column alone and
+  /// save the responses outside the colouring's pattern; see petscDenseProbe
+  bool petsc_dense_probe;
+  bool petsc_dense_probe_done{false};
 
   // Diagnostics from CVODE
   int nsteps{0};
